@@ -28,6 +28,19 @@ test("repairChineseEmphasis balances the opposite delimiter when exactly one bou
   );
 });
 
+test("repairChineseEmphasis is fed the complete raw stream, not prior display output", () => {
+  const chunks = ["中文*，重", "点*", "内容"];
+  const rawContent = chunks.join("");
+
+  assert.equal(repairChineseEmphasis(rawContent, "zh"), "中文 *，重点* 内容");
+  assert.equal(
+    repairChineseEmphasis(
+      repairChineseEmphasis(chunks.slice(0, 2).join(""), "zh") + chunks[2],
+      "zh",
+    ),
+    "中文 *，重点*内容",
+  );
+});
 test("repairChineseEmphasis leaves inner whitespace and literal stars unchanged", () => {
   const inputs = [
     "* 重点 *",
