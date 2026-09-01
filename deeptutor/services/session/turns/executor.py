@@ -35,6 +35,7 @@ from .._turn_runtime_shared import (
     _mastery_action_context,
     _mastery_path_id,
     _narration_marker_call_id,
+    _repair_chinese_emphasis_for_persistence,
     _partner_group_references,
     _reading_action_context,
     _reading_material_id,
@@ -836,8 +837,13 @@ class TurnExecutor:
             await fill_preview_text(generated_attachments)
 
             # The persisted answer is the captured content minus any narration
-            # rounds (their text stayed in the trace, never the answer).
-            assistant_content = _persisted_answer()
+            # rounds (their text stayed in the trace, never the answer). Apply
+            # the CJK Markdown repair only after every streamed segment has
+            # arrived, so no incomplete response is ever rewritten.
+            assistant_content = _repair_chinese_emphasis_for_persistence(
+                _persisted_answer(),
+                str(payload.get("language", "en") or "en"),
+            )
 
             # Assistant continues the same branch as the user message it
             # answers. If we just persisted a new user row we chain off
