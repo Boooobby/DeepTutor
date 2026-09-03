@@ -192,6 +192,23 @@ class GenerateTopicDraftRequest(BaseModel):
     must_cover: list[str] = Field(default_factory=list, max_length=40)
 
 
+class StartLearningPlanRequest(GenerateTopicDraftRequest):
+    """The existing form data plus explicitly opted-in study context."""
+
+    context_path_id: str = Field(default="", max_length=200)
+    selected_session_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
+class PlanningSessionMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=4_000)
+
+
+class SettleLearningPlanRequest(GenerateTopicDraftRequest):
+    """The form values the learner accepted after discussing the route."""
+
+    existing_path_id: str = Field(default="", max_length=200)
+
+
 class ConfirmTopicRequest(GenerateTopicDraftRequest):
     description: str = Field(default="", max_length=500)
     emoji: str = Field(default="🧭", max_length=16)
@@ -224,6 +241,95 @@ def _topic_sources(items: list[TopicSourceRequest]) -> list[TopicSource]:
         )
         for index, item in enumerate(items)
     ]
+
+
+def _draft_input(body: GenerateTopicDraftRequest) -> dict:
+    return body.model_dump(mode="json")
+
+
+async def _generate_route_draft(
+    *,
+    name: str,
+    goal: str,
+    sources: list[TopicSource],
+    must_cover: list[str],
+) -> dict:
+    from deeptutor.learning.topic_generation import TopicGenerationError, generate_topic_draft
+
+    try:
+        return await generate_topic_draft(
+            name=name,
+            goal=goal,
+            sources=sources,
+            language=get_response_language(),
+            must_cover=must_cover,
+        )
+    except TopicGenerationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _selected_mastery_context(body: StartLearningPlanRequest) -> str:
+    """Read only explicitly selected, current-user mastery study sessions."""
+    selected_ids = list(
+        dict.fromkeys(item.strip() for item in body.selected_session_ids if item.strip())
+    )
+    if len(selected_ids) != len(body.selected_session_ids):
+        raise HTTPException(
+            status_code=422, detail="selected_session_ids must be non-empty and unique"
+        )
+    path_id = body.context_path_id.strip()
+    if path_id:
+        _validate_book_id(path_id)
+    if not selected_ids:
+        return ""
+
+    from deeptutor.services.session import get_session_store
+
+    session_store = get_session_store()
+    excerpts: list[str] = []
+    for session_id in selected_ids:
+        session = await session_store.get_session_with_messages(session_id)
+        # get_session_with_messages is the access boundary for both supported
+        # stores: a session belonging to another user is indistinguishable from
+        # a missing session here.
+        if session is None:
+            raise HTTPException(status_code=404, detail="Selected study session not found")
+        preferences = session.get("preferences") or {}
+        session_path_id = str(preferences.get("mastery_path_id") or "")
+        if preferences.get("workspace_mode") != "mastery_path" or not session_path_id:
+            raise HTTPException(
+                status_code=422, detail="Selected session is not a Mastery study session"
+            )
+        if path_id and session_path_id != path_id:
+            raise HTTPException(
+                status_code=422, detail="Selected session is outside context_path_id"
+            )
+        text = "\n".join(
+            f"{message.get('role', 'user')}: {str(message.get('content') or '').strip()}"
+            for message in session.get("messages", [])[-24:]
+            if str(message.get("content") or "").strip()
+        )
+        if text:
+            excerpts.append(f"Study session {session_id}:\n{text[:6_000]}")
+    return "\n\n".join(excerpts)[:20_000]
+
+
+def _learning_plan_context_request(plan: dict) -> StartLearningPlanRequest:
+    """Combine settled form data with separately durable context references."""
+    return StartLearningPlanRequest.model_validate(
+        {
+            **plan["input"],
+            "context_path_id": plan["context_path_id"],
+            "selected_session_ids": plan["selected_session_ids"],
+        }
+    )
+
+
+def _learning_plan_owner_id() -> str:
+    """Bind plan records to the request user as well as the workspace."""
+    from deeptutor.multi_user.context import get_current_user
+
+    return get_current_user().id
 
 
 def _review_queue(progress) -> list[dict]:
@@ -345,18 +451,188 @@ async def list_topic_index():
 
 @router.post("/topics/draft")
 async def generate_topic_route(body: GenerateTopicDraftRequest):
-    from deeptutor.learning.topic_generation import TopicGenerationError, generate_topic_draft
+    return await _generate_route_draft(
+        name=body.name,
+        goal=body.goal,
+        sources=_topic_sources(body.sources),
+        must_cover=body.must_cover,
+    )
 
-    try:
-        return await generate_topic_draft(
-            name=body.name,
-            goal=body.goal,
-            sources=_topic_sources(body.sources),
-            language=get_response_language(),
-            must_cover=body.must_cover,
+
+@router.post("/learning-plans")
+async def start_learning_plan(body: StartLearningPlanRequest):
+    """Open a durable planning discussion without creating or changing a path."""
+    await _selected_mastery_context(body)  # Validate access now; do not retain session content.
+    plan_id = f"learning_plan_{uuid.uuid4().hex}"
+    store = LearningStore()
+    payload = await asyncio.to_thread(
+        store.create_learning_plan,
+        plan_id,
+        _draft_input(GenerateTopicDraftRequest.model_validate(body.model_dump())),
+        owner_id=_learning_plan_owner_id(),
+        context_path_id=body.context_path_id.strip(),
+        selected_session_ids=body.selected_session_ids,
+    )
+    planning_session_id = f"planning_{uuid.uuid4().hex}"
+    await asyncio.to_thread(
+        store.create_planning_session,
+        planning_session_id,
+        owner_id=_learning_plan_owner_id(),
+        plan_id=plan_id,
+    )
+    payload["planning_session_id"] = planning_session_id
+    return payload
+
+
+async def _get_learning_plan_or_404(plan_id: str) -> dict:
+    plan = await asyncio.to_thread(
+        LearningStore().get_learning_plan,
+        plan_id,
+        owner_id=_learning_plan_owner_id(),
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Learning plan not found")
+    return plan
+
+
+@router.get("/learning-plans/{plan_id}")
+async def get_learning_plan(plan_id: str):
+    return await _get_learning_plan_or_404(plan_id)
+
+
+@router.post("/learning-plans/{plan_id}/planning-session/messages")
+async def discuss_learning_plan(plan_id: str, body: PlanningSessionMessageRequest):
+    plan = await _get_learning_plan_or_404(plan_id)
+    if plan["state"] not in {"discussing", "settled"}:
+        raise HTTPException(
+            status_code=409, detail="Learning plan is no longer open for discussion"
         )
-    except TopicGenerationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Re-read the selected sessions immediately before using their content.
+    # Their text is deliberately not persisted in the plan, so an ownership or
+    # access change cannot turn an earlier authorized read into a later leak.
+    context = await _selected_mastery_context(_learning_plan_context_request(plan))
+    store = LearningStore()
+    await asyncio.to_thread(
+        store.append_planning_session_message,
+        plan_id,
+        "user",
+        body.content.strip(),
+        owner_id=_learning_plan_owner_id(),
+    )
+    from deeptutor.services.llm import complete
+
+    history = "\n".join(
+        f"{message['role']}: {message['content']}" for message in plan["messages"][-12:]
+    )
+    reply = await complete(
+        prompt=(
+            "Help the learner settle a Mastery Path route plan. Discuss scope, goals, and sequencing; "
+            "do not claim the path has been created.\n\n"
+            f"Form data: {json.dumps(plan['input'], ensure_ascii=False)}\n\n"
+            f"Selected read-only study context:\n{context or '(none)'}\n\n"
+            f"Discussion:\n{history}\nuser: {body.content.strip()}"
+        ),
+        system_prompt="You are a concise learning-route planning assistant.",
+    )
+    await asyncio.to_thread(
+        store.append_planning_session_message,
+        plan_id,
+        "assistant",
+        str(reply).strip(),
+        owner_id=_learning_plan_owner_id(),
+    )
+    return await _get_learning_plan_or_404(plan_id)
+
+
+@router.post("/learning-plans/{plan_id}/settle")
+async def settle_learning_plan(plan_id: str, body: SettleLearningPlanRequest):
+    store = LearningStore()
+    try:
+        return await asyncio.to_thread(
+            store.settle_learning_plan,
+            plan_id,
+            _draft_input(body),
+            owner_id=_learning_plan_owner_id(),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Learning plan not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/learning-plans/{plan_id}/route-draft")
+async def generate_learning_plan_route_draft(plan_id: str):
+    plan = await _get_learning_plan_or_404(plan_id)
+    if plan["state"] == "draft_ready":
+        return plan["draft"]
+    if plan["state"] != "settled":
+        raise HTTPException(status_code=409, detail="Learning plan must be settled before drafting")
+    draft_input = GenerateTopicDraftRequest.model_validate(plan["input"])
+    draft = await _generate_route_draft(
+        name=draft_input.name,
+        goal=draft_input.goal,
+        sources=_topic_sources(draft_input.sources),
+        must_cover=draft_input.must_cover,
+    )
+    try:
+        await asyncio.to_thread(
+            LearningStore().save_learning_plan_route_draft,
+            plan_id,
+            draft,
+            owner_id=_learning_plan_owner_id(),
+        )
+        await asyncio.to_thread(
+            LearningStore().save_route_draft_version,
+            f"draft_{uuid.uuid4().hex}",
+            draft,
+            owner_id=_learning_plan_owner_id(),
+            plan_id=plan_id,
+            plan_revision=plan["brief_revision"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return draft
+
+
+@router.post("/planning-sessions")
+async def create_reusable_planning_session(plan_id: str = ""):
+    """Open an optional planning conversation, reusable for a plan revision."""
+    if plan_id:
+        await _get_learning_plan_or_404(plan_id)
+    session_id = f"planning_{uuid.uuid4().hex}"
+    return await asyncio.to_thread(
+        LearningStore().create_planning_session,
+        session_id,
+        owner_id=_learning_plan_owner_id(),
+        plan_id=plan_id,
+    )
+
+
+@router.get("/planning-sessions/{planning_session_id}")
+async def get_reusable_planning_session(planning_session_id: str):
+    session = await asyncio.to_thread(
+        LearningStore().get_planning_session,
+        planning_session_id,
+        owner_id=_learning_plan_owner_id(),
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Planning session not found")
+    return session
+
+
+@router.post("/learning-plans/{plan_id}/brief")
+async def update_learning_plan_brief(plan_id: str, body: SettleLearningPlanRequest):
+    try:
+        return await asyncio.to_thread(
+            LearningStore().update_learning_plan_brief,
+            plan_id,
+            _draft_input(body),
+            owner_id=_learning_plan_owner_id(),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Learning plan not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/topics")

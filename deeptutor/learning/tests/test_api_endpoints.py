@@ -132,6 +132,256 @@ class TestListProgress:
 
 
 class TestTopicProductApi:
+    def test_quick_create_route_draft_contract_is_unchanged(self, client):
+        response_json = json.dumps(
+            {
+                "description": "A compact route.",
+                "modules": [
+                    {
+                        "name": "Foundations",
+                        "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            response = client.post(
+                "/api/mastery-paths/topics/draft",
+                json={"name": "Linear Algebra", "goal": "Learn vectors", "sources": []},
+            )
+
+        assert response.status_code == 200
+        assert set(response.json()) == {
+            "description",
+            "modules",
+            "sources",
+            "discarded_module_count",
+            "discarded_modules",
+            "module_limit",
+            "coverage",
+        }
+
+    def test_learning_plan_lifecycle_converges_on_route_draft(self, client):
+        form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}
+        response_json = json.dumps(
+            {
+                "description": "A compact route.",
+                "modules": [
+                    {
+                        "name": "Foundations",
+                        "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            quick_draft = client.post("/api/mastery-paths/topics/draft", json=form)
+        assert quick_draft.status_code == 200
+
+        started = client.post("/api/mastery-paths/learning-plans", json=form)
+        assert started.status_code == 200
+        plan_id = started.json()["plan_id"]
+        assert started.json()["state"] == "discussing"
+        assert started.json()["messages"] == []
+        assert client.get("/api/mastery-paths/topics").json()["topics"] == []
+
+        settled = client.post(f"/api/mastery-paths/learning-plans/{plan_id}/settle", json=form)
+        assert settled.status_code == 200
+        assert settled.json()["state"] == "settled"
+
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            drafted = client.post(f"/api/mastery-paths/learning-plans/{plan_id}/route-draft")
+
+        assert drafted.status_code == 200
+        assert drafted.json() == quick_draft.json()
+        assert set(drafted.json()) == {
+            "description",
+            "modules",
+            "sources",
+            "discarded_module_count",
+            "discarded_modules",
+            "module_limit",
+            "coverage",
+        }
+        assert (
+            client.get(f"/api/mastery-paths/learning-plans/{plan_id}").json()["state"]
+            == "draft_ready"
+        )
+        confirmed = client.post("/api/mastery-paths/topics", json={**form, **drafted.json()})
+        assert confirmed.status_code == 200
+        assert confirmed.json()["name"] == form["name"]
+
+    def test_learning_plan_discussion_is_persisted_separately(self, client):
+        form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}
+        plan_id = client.post("/api/mastery-paths/learning-plans", json=form).json()["plan_id"]
+        with patch(
+            "deeptutor.services.llm.complete",
+            new=AsyncMock(return_value="Start with vector operations, then matrices."),
+        ):
+            response = client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/planning-session/messages",
+                json={"content": "I need this for computer graphics."},
+            )
+
+        assert response.status_code == 200
+        assert [(item["role"], item["content"]) for item in response.json()["messages"]] == [
+            ("user", "I need this for computer graphics."),
+            ("assistant", "Start with vector operations, then matrices."),
+        ]
+        assert client.get("/api/mastery-paths/topics").json()["topics"] == []
+
+    def test_plan_brief_update_and_reusable_planning_session(self, client):
+        form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}
+        plan = client.post("/api/mastery-paths/learning-plans", json=form).json()
+        updated = client.post(
+            f"/api/mastery-paths/learning-plans/{plan['plan_id']}/brief",
+            json={**form, "goal": "Practice vectors", "existing_path_id": ""},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["brief_revision"] == 1
+        planning = client.post("/api/mastery-paths/planning-sessions").json()
+        assert planning["planning_session_id"].startswith("planning_")
+        assert (
+            client.get(
+                f"/api/mastery-paths/planning-sessions/{planning['planning_session_id']}"
+            ).status_code
+            == 200
+        )
+
+    def test_learning_plan_rejects_invalid_transitions_and_missing_plan(self, client):
+        form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}
+        assert (
+            client.post("/api/mastery-paths/learning-plans/missing/route-draft").status_code == 404
+        )
+        started = client.post("/api/mastery-paths/learning-plans", json=form).json()
+        plan_id = started["plan_id"]
+        assert (
+            client.post(f"/api/mastery-paths/learning-plans/{plan_id}/route-draft").status_code
+            == 409
+        )
+        assert (
+            client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/settle", json=form
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/settle", json=form
+            ).status_code
+            == 409
+        )
+
+    def test_learning_plan_operations_require_the_current_owner(self, client, monkeypatch):
+        form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}
+        monkeypatch.setattr(
+            "deeptutor.api.routers.mastery_path._learning_plan_owner_id", lambda: "owner-a"
+        )
+        plan_id = client.post("/api/mastery-paths/learning-plans", json=form).json()["plan_id"]
+        monkeypatch.setattr(
+            "deeptutor.api.routers.mastery_path._learning_plan_owner_id", lambda: "owner-b"
+        )
+
+        assert client.get(f"/api/mastery-paths/learning-plans/{plan_id}").status_code == 404
+        assert (
+            client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/planning-session/messages",
+                json={"content": "Can I edit this?"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/settle", json=form
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(f"/api/mastery-paths/learning-plans/{plan_id}/route-draft").status_code
+            == 404
+        )
+
+    def test_learning_plan_selected_sessions_are_read_only_and_scoped(
+        self, client, app, monkeypatch
+    ):
+        class SessionStore:
+            def __init__(self):
+                self.calls = []
+
+            async def get_session_with_messages(self, session_id):
+                self.calls.append(session_id)
+                if session_id == "other-user":
+                    return None
+                return {
+                    "preferences": {
+                        "workspace_mode": "mastery_path",
+                        "mastery_path_id": "path-1",
+                    },
+                    "messages": [{"role": "user", "content": "I know matrices already."}],
+                }
+
+        session_store = SessionStore()
+        monkeypatch.setattr("deeptutor.services.session.get_session_store", lambda: session_store)
+        form = {
+            "name": "Linear Algebra",
+            "goal": "Learn vectors",
+            "sources": [],
+            "context_path_id": "path-1",
+            "selected_session_ids": ["own-study"],
+        }
+        before = LearningStore(root=app.state.learning_root).load("path-1")
+        response = client.post("/api/mastery-paths/learning-plans", json=form)
+        after = LearningStore(root=app.state.learning_root).load("path-1")
+
+        assert response.status_code == 200
+        assert session_store.calls == ["own-study"]
+        assert before is after is None
+        plan_id = response.json()["plan_id"]
+        assert "I know matrices already." not in json.dumps(response.json())
+        settled = client.post(
+            f"/api/mastery-paths/learning-plans/{plan_id}/settle",
+            json=form,
+        )
+        assert settled.status_code == 200
+        assert "context_path_id" not in settled.json()["input"]
+        assert "selected_session_ids" not in settled.json()["input"]
+        llm = AsyncMock(return_value="We can shorten the vector unit.")
+        with patch(
+            "deeptutor.services.llm.complete",
+            new=llm,
+        ):
+            discussion = client.post(
+                f"/api/mastery-paths/learning-plans/{plan_id}/planning-session/messages",
+                json={"content": "Use my prior study to shorten the route."},
+            )
+        assert discussion.status_code == 200
+        assert session_store.calls == ["own-study", "own-study"]
+        assert "I know matrices already." in llm.await_args.kwargs["prompt"]
+        assert LearningStore(root=app.state.learning_root).load("path-1") is None
+        assert (
+            client.post(
+                "/api/mastery-paths/learning-plans",
+                json={**form, "selected_session_ids": ["other-user"]},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/mastery-paths/learning-plans",
+                json={**form, "context_path_id": "different-path"},
+            ).status_code
+            == 422
+        )
+
     def test_edit_topic_map_preserves_reordered_evidence_by_entity_id(self, client, app):
         created = client.post(
             "/api/mastery-paths/topics",

@@ -31,6 +31,50 @@ def store(tmp_path):
     return LearningStore(root=tmp_path)
 
 
+# ── Learning plans ─────────────────────────────────────────────────────
+
+
+class TestLearningPlans:
+    def test_owner_scopes_reads_and_all_state_mutations(self, store):
+        plan = store.create_learning_plan(
+            "plan-1",
+            {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []},
+            owner_id="owner-a",
+        )
+        assert plan["state"] == "discussing"
+        assert store.get_learning_plan("plan-1", owner_id="owner-b") is None
+
+        with pytest.raises(KeyError):
+            store.append_planning_session_message("plan-1", "user", "hello", owner_id="owner-b")
+        with pytest.raises(KeyError):
+            store.settle_learning_plan("plan-1", {}, owner_id="owner-b")
+        with pytest.raises(KeyError):
+            store.save_learning_plan_route_draft("plan-1", {}, owner_id="owner-b")
+
+        store.append_planning_session_message("plan-1", "user", "hello", owner_id="owner-a")
+        settled = store.settle_learning_plan(
+            "plan-1",
+            {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []},
+            owner_id="owner-a",
+        )
+        assert settled["state"] == "settled"
+        drafted = store.save_learning_plan_route_draft(
+            "plan-1", {"modules": []}, owner_id="owner-a"
+        )
+        assert drafted["state"] == "draft_ready"
+
+    def test_brief_revision_and_reusable_planning_session(self, store):
+        store.create_learning_plan("plan-1", {"name": "A"}, owner_id="owner-a")
+        updated = store.update_learning_plan_brief(
+            "plan-1", {"name": "B", "goal": "Practice"}, owner_id="owner-a"
+        )
+        assert updated["brief"] == {"name": "B", "goal": "Practice"}
+        assert updated["brief_revision"] == 1
+        session = store.create_planning_session("planning-1", owner_id="owner-a", plan_id="plan-1")
+        assert session["planning_session_id"] == "planning-1"
+        assert store.get_planning_session("planning-1", owner_id="owner-b") is None
+
+
 # ── save / load ──────────────────────────────────────────────────────────
 
 

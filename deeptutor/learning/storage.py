@@ -456,8 +456,69 @@ class LearningStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_mastery_topic_sources_path
                         ON mastery_topic_sources(path_id, position);
+
+                    CREATE TABLE IF NOT EXISTS mastery_learning_plans (
+                        plan_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        input_json TEXT NOT NULL,
+                        context_path_id TEXT NOT NULL DEFAULT '',
+                        selected_session_ids_json TEXT NOT NULL DEFAULT '[]',
+                        draft_json TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS mastery_planning_session_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        plan_id TEXT NOT NULL REFERENCES mastery_learning_plans(plan_id)
+                            ON DELETE CASCADE,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_mastery_planning_session_messages
+                        ON mastery_planning_session_messages(plan_id, id);
+                    CREATE TABLE IF NOT EXISTS mastery_planning_sessions (
+                        planning_session_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        plan_id TEXT,
+                        state TEXT NOT NULL DEFAULT 'open',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS mastery_route_drafts (
+                        draft_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        plan_id TEXT,
+                        plan_revision INTEGER NOT NULL DEFAULT 0,
+                        version INTEGER NOT NULL,
+                        draft_json TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_mastery_route_drafts_plan
+                        ON mastery_route_drafts(plan_id, version);
                     """
                 )
+                columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(mastery_learning_plans)").fetchall()
+                }
+                if "owner_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE mastery_learning_plans ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-admin'"
+                    )
+                if "brief_json" not in columns:
+                    conn.execute(
+                        "ALTER TABLE mastery_learning_plans ADD COLUMN brief_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                if "brief_revision" not in columns:
+                    conn.execute(
+                        "ALTER TABLE mastery_learning_plans ADD COLUMN brief_revision INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "existing_path_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE mastery_learning_plans ADD COLUMN existing_path_id TEXT NOT NULL DEFAULT ''"
+                    )
                 # V2 metadata is a persisted part of every topic, not a
                 # runtime-only fallback. Existing V1 paths receive neutral,
                 # deterministic metadata during schema initialization; their
@@ -501,6 +562,237 @@ class LearningStore:
             yield conn
         finally:
             conn.close()
+
+    # ── Learning plan planning ──────────────────────────────────────────────
+
+    def create_learning_plan(
+        self,
+        plan_id: str,
+        input_data: dict[str, Any],
+        *,
+        owner_id: str,
+        context_path_id: str = "",
+        selected_session_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a learning plan independently from ordinary study sessions."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mastery_learning_plans (
+                    plan_id, owner_id, state, input_json, context_path_id,
+                    selected_session_ids_json, draft_json, created_at, updated_at
+                ) VALUES (?, ?, 'discussing', ?, ?, ?, '', ?, ?)
+                """,
+                (
+                    plan_id,
+                    owner_id,
+                    json.dumps(input_data, ensure_ascii=False),
+                    context_path_id,
+                    json.dumps(selected_session_ids or [], ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
+
+    def get_learning_plan(self, plan_id: str, *, owner_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()
+            if row is None:
+                return None
+            messages = conn.execute(
+                """
+                SELECT role, content, created_at
+                FROM mastery_planning_session_messages WHERE plan_id = ? ORDER BY id
+                """,
+                (plan_id,),
+            ).fetchall()
+        payload = dict(row)
+        return {
+            "plan_id": payload["plan_id"],
+            "state": payload["state"],
+            "input": json.loads(payload["input_json"]),
+            "context_path_id": payload["context_path_id"],
+            "selected_session_ids": json.loads(payload["selected_session_ids_json"]),
+            "draft": json.loads(payload["draft_json"]) if payload["draft_json"] else None,
+            "brief": json.loads(payload.get("brief_json") or "{}"),
+            "brief_revision": int(payload.get("brief_revision") or 0),
+            "existing_path_id": payload.get("existing_path_id") or "",
+            "messages": [dict(message) for message in messages],
+            "created_at": payload["created_at"],
+            "updated_at": payload["updated_at"],
+        }
+
+    def append_planning_session_message(
+        self, plan_id: str, role: str, content: str, *, owner_id: str
+    ) -> None:
+        now = time.time()
+        with self._connect() as conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                    (plan_id, owner_id),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError(plan_id)
+            conn.execute(
+                """
+                INSERT INTO mastery_planning_session_messages (plan_id, role, content, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (plan_id, role, content, now),
+            )
+            conn.execute(
+                "UPDATE mastery_learning_plans SET updated_at = ? WHERE plan_id = ?",
+                (now, plan_id),
+            )
+
+    def settle_learning_plan(
+        self, plan_id: str, input_data: dict[str, Any], *, owner_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_id)
+            if row["state"] != "discussing":
+                raise ValueError(f"Cannot settle learning plan in state {row['state']!r}")
+            conn.execute(
+                """
+                UPDATE mastery_learning_plans
+                SET state = 'settled', input_json = ?, brief_json = ?, brief_revision = brief_revision + 1,
+                    existing_path_id = ?, updated_at = ?
+                WHERE plan_id = ? AND owner_id = ?
+                """,
+                (
+                    json.dumps(input_data, ensure_ascii=False),
+                    json.dumps(input_data, ensure_ascii=False),
+                    str(input_data.get("existing_path_id") or ""),
+                    time.time(),
+                    plan_id,
+                    owner_id,
+                ),
+            )
+        return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
+
+    def update_learning_plan_brief(
+        self, plan_id: str, brief: dict[str, Any], *, owner_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_id)
+            if row["state"] == "draft_ready":
+                raise ValueError("Cannot update a plan after a route draft is ready")
+            conn.execute(
+                """
+                UPDATE mastery_learning_plans
+                SET brief_json = ?, input_json = ?, brief_revision = brief_revision + 1,
+                    existing_path_id = ?, state = 'settled', updated_at = ?
+                WHERE plan_id = ? AND owner_id = ?
+                """,
+                (
+                    json.dumps(brief, ensure_ascii=False),
+                    json.dumps(brief, ensure_ascii=False),
+                    str(brief.get("existing_path_id") or ""),
+                    time.time(),
+                    plan_id,
+                    owner_id,
+                ),
+            )
+        return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
+
+    def create_planning_session(
+        self, planning_session_id: str, *, owner_id: str, plan_id: str = ""
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mastery_planning_sessions
+                    (planning_session_id, owner_id, plan_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (planning_session_id, owner_id, plan_id, now, now),
+            )
+        return self.get_planning_session(planning_session_id, owner_id=owner_id) or {}
+
+    def get_planning_session(
+        self, planning_session_id: str, *, owner_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM mastery_planning_sessions WHERE planning_session_id = ? AND owner_id = ?",
+                (planning_session_id, owner_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_route_draft_version(
+        self,
+        draft_id: str,
+        draft: dict[str, Any],
+        *,
+        owner_id: str,
+        plan_id: str = "",
+        plan_revision: int = 0,
+    ) -> None:
+        with self._connect() as conn:
+            version = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 FROM mastery_route_drafts WHERE plan_id = ? AND owner_id = ?",
+                    (plan_id, owner_id),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                INSERT INTO mastery_route_drafts
+                    (draft_id, owner_id, plan_id, plan_revision, version, draft_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    draft_id,
+                    owner_id,
+                    plan_id,
+                    int(plan_revision),
+                    version,
+                    json.dumps(draft, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+
+    def save_learning_plan_route_draft(
+        self, plan_id: str, draft: dict[str, Any], *, owner_id: str
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_id)
+            if row["state"] == "draft_ready":
+                return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
+            if row["state"] != "settled":
+                raise ValueError(f"Cannot generate a draft from state {row['state']!r}")
+            conn.execute(
+                """
+                UPDATE mastery_learning_plans
+                SET state = 'draft_ready', draft_json = ?, updated_at = ?
+                WHERE plan_id = ? AND owner_id = ?
+                """,
+                (json.dumps(draft, ensure_ascii=False), time.time(), plan_id, owner_id),
+            )
+        return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
 
     @staticmethod
     def _progress_from_row(row: sqlite3.Row) -> LearningProgress:
