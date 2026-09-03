@@ -163,6 +163,265 @@ class TestTopicProductApi:
             "module_limit",
             "coverage",
         }
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            no_sources = client.post(
+                "/api/mastery-paths/topics/draft",
+                json={"name": "Linear Algebra", "goal": "Learn vectors"},
+            )
+        assert no_sources.status_code == 200
+
+    def test_structured_learning_plan_validates_and_forwards_quick_path(self, client):
+        form = {
+            "topic": {"name": "Linear Algebra", "purpose": "Prepare for graphics work"},
+            "sources": [
+                {
+                    "kind": "goal",
+                    "label": "Selected reference",
+                    "excerpt": "Vectors and matrices",
+                }
+            ],
+            "learner_context": {"current_level": "beginner"},
+            "scope": {"mode": "selected", "include": ["vectors"]},
+            "learning_preferences": {
+                "theory_practice": "practice",
+                "granularity": "detailed",
+                "mathematical_rigor": "rigorous",
+                "activities": ["reading", "practice"],
+            },
+            "time_constraints": {"mode": "weekly", "weekly_hours": 4},
+        }
+        response_json = json.dumps(
+            {
+                "description": "A compact route.",
+                "modules": [
+                    {
+                        "name": "Foundations",
+                        "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        complete = AsyncMock(return_value=response_json)
+        with patch("deeptutor.learning.topic_generation.complete", new=complete):
+            response = client.post("/api/mastery-paths/topics/draft", json=form)
+
+        assert response.status_code == 200
+        prompt = complete.await_args.kwargs["prompt"]
+        assert '"current_level": "beginner"' in prompt
+        assert '"label": "Selected reference"' in prompt
+        assert '"weekly_hours": 4.0' in prompt
+        assert (
+            client.post(
+                "/api/mastery-paths/topics/draft",
+                json={**form, "time_constraints": {"mode": "weekly"}},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/mastery-paths/topics/draft",
+                json={**form, "learning_preferences": {"theory_practice": "invalid"}},
+            ).status_code
+            == 422
+        )
+
+    def test_minimal_structured_form_allows_omitted_or_null_optional_groups(self, client):
+        response_json = json.dumps(
+            {
+                "description": "A compact route.",
+                "modules": [
+                    {
+                        "name": "Foundations",
+                        "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            minimal = client.post(
+                "/api/mastery-paths/topics/draft",
+                json={"topic": {"name": "Vectors", "purpose": "Learn basics"}},
+            )
+            explicit_null = client.post(
+                "/api/mastery-paths/topics/draft",
+                json={
+                    "topic": {"name": "Vectors", "purpose": "Learn basics"},
+                    "sources": None,
+                    "learner_context": None,
+                    "scope": None,
+                    "learning_preferences": None,
+                    "time_constraints": None,
+                    "milestones": None,
+                },
+            )
+        assert minimal.status_code == explicit_null.status_code == 200
+        planning = client.post(
+            "/api/mastery-paths/learning-plans",
+            json={
+                "topic": {"name": "Vectors", "purpose": "Learn basics"},
+                "context_path_id": None,
+                "selected_session_ids": None,
+            },
+        )
+        assert planning.status_code == 200
+
+    def test_structured_purpose_duration_and_milestones(self, client):
+        form = {
+            "topic": {
+                "name": "Research Methods",
+                "purpose": "Prepare thesis",
+                "learning_purpose": "custom",
+                "custom_purpose": "Thesis preparation",
+            },
+            "learner_context": {
+                "current_level": "intermediate",
+                "known_topics": ["literature review"],
+                "skipped_topics": ["basic citations"],
+            },
+            "scope": {
+                "mode": "custom",
+                "include": ["qualitative methods"],
+                "exclude": ["statistics"],
+            },
+            "learning_preferences": {
+                "theory_practice": "balanced",
+                "granularity": "standard",
+                "mathematical_rigor": "intuitive",
+                "activities": ["reading", "projects"],
+            },
+            "time_constraints": {
+                "mode": "duration",
+                "target_duration_weeks": 12,
+                "session_duration_minutes": 45,
+            },
+            "milestones": {
+                "preference": "suggest",
+                "items": [{"name": "Proposal draft", "target_week": 4}],
+            },
+            "existing_path_id": "topic_existing",
+        }
+        response_json = json.dumps(
+            {
+                "description": "Route",
+                "modules": [
+                    {
+                        "name": "Methods",
+                        "knowledge_points": [{"name": "Design", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        complete = AsyncMock(return_value=response_json)
+        with patch("deeptutor.learning.topic_generation.complete", new=complete):
+            response = client.post("/api/mastery-paths/topics/draft", json=form)
+        assert response.status_code == 200
+        prompt = complete.await_args.kwargs["prompt"]
+        assert '"known_topics": ["literature review"]' in prompt
+        assert '"target_duration_weeks": 12.0' in prompt
+        assert '"target_week": 4' in prompt
+        assert '"existing_path_id": "topic_existing"' in prompt
+        invalid_purpose = {
+            **form,
+            "topic": {"name": "Research Methods", "purpose": "X", "learning_purpose": "invalid"},
+        }
+        assert (
+            client.post("/api/mastery-paths/topics/draft", json=invalid_purpose).status_code == 422
+        )
+        invalid_custom = {
+            **form,
+            "topic": {"name": "Research Methods", "purpose": "X", "learning_purpose": "custom"},
+        }
+        assert (
+            client.post("/api/mastery-paths/topics/draft", json=invalid_custom).status_code == 422
+        )
+        invalid_duration = {
+            **form,
+            "time_constraints": {"mode": "duration", "session_duration_minutes": 45},
+        }
+        assert (
+            client.post("/api/mastery-paths/topics/draft", json=invalid_duration).status_code == 422
+        )
+        invalid_session_time = {
+            **form,
+            "time_constraints": {"session_duration_minutes": 45},
+        }
+        assert (
+            client.post("/api/mastery-paths/topics/draft", json=invalid_session_time).status_code
+            == 422
+        )
+        invalid_time_mode = {**form, "time_constraints": {"mode": "soon"}}
+        assert (
+            client.post("/api/mastery-paths/topics/draft", json=invalid_time_mode).status_code
+            == 422
+        )
+
+    def test_ai_plan_revises_brief_and_converges_on_route_draft_contract(self, client):
+        form = {
+            "topic": {"name": "Linear Algebra", "purpose": "Prepare for graphics work"},
+            "sources": [],
+            "learner_context": {"current_level": "beginner"},
+            "time_constraints": {"mode": "unconstrained"},
+        }
+        plan = client.post("/api/mastery-paths/learning-plans", json=form).json()
+        assert plan["brief"]["time_constraints"]["mode"] == "unconstrained"
+        ai_reply = json.dumps(
+            {
+                "reply": "I will make this a practice-heavy route.",
+                "plan_brief": {"learning_preferences": {"theory_practice": "practice"}},
+            }
+        )
+        with patch("deeptutor.services.llm.complete", new=AsyncMock(return_value=ai_reply)):
+            discussed = client.post(
+                f"/api/mastery-paths/learning-plans/{plan['plan_id']}/planning-session/messages",
+                json={"content": "Please prioritize exercises."},
+            )
+        assert discussed.status_code == 200
+        assert discussed.json()["brief"]["learning_preferences"]["theory_practice"] == "practice"
+        assert discussed.json()["state"] == "discussing"
+        assert discussed.json()["brief_revision"] == 1
+
+        settled = client.post(
+            f"/api/mastery-paths/learning-plans/{plan['plan_id']}/settle",
+            json={
+                **form,
+                "learning_preferences": {"theory_practice": "practice"},
+            },
+        )
+        assert settled.status_code == 200
+        assert settled.json()["brief_revision"] == 2
+        response_json = json.dumps(
+            {
+                "description": "A compact route.",
+                "modules": [
+                    {
+                        "name": "Foundations",
+                        "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                    }
+                ],
+            }
+        )
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            ai_draft = client.post(
+                f"/api/mastery-paths/learning-plans/{plan['plan_id']}/route-draft"
+            )
+        with patch(
+            "deeptutor.learning.topic_generation.complete",
+            new=AsyncMock(return_value=response_json),
+        ):
+            quick_draft = client.post(
+                "/api/mastery-paths/topics/draft", json=settled.json()["brief"]
+            )
+        assert ai_draft.status_code == quick_draft.status_code == 200
+        assert set(ai_draft.json()) == set(quick_draft.json())
 
     def test_learning_plan_lifecycle_converges_on_route_draft(self, client):
         form = {"name": "Linear Algebra", "goal": "Learn vectors", "sources": []}

@@ -581,8 +581,8 @@ class LearningStore:
                 """
                 INSERT INTO mastery_learning_plans (
                     plan_id, owner_id, state, input_json, context_path_id,
-                    selected_session_ids_json, draft_json, created_at, updated_at
-                ) VALUES (?, ?, 'discussing', ?, ?, ?, '', ?, ?)
+                    selected_session_ids_json, draft_json, brief_json, created_at, updated_at
+                ) VALUES (?, ?, 'discussing', ?, ?, ?, '', ?, ?, ?)
                 """,
                 (
                     plan_id,
@@ -590,6 +590,7 @@ class LearningStore:
                     json.dumps(input_data, ensure_ascii=False),
                     context_path_id,
                     json.dumps(selected_session_ids or [], ensure_ascii=False),
+                    json.dumps(input_data, ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -709,6 +710,29 @@ class LearningStore:
                     plan_id,
                     owner_id,
                 ),
+            )
+        return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
+
+    def revise_learning_plan_brief(
+        self, plan_id: str, brief: dict[str, Any], *, owner_id: str
+    ) -> dict[str, Any]:
+        """Save an AI-proposed brief without settling or changing a route."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_id)
+            if row["state"] == "draft_ready":
+                raise ValueError("Cannot revise a plan after a route draft is ready")
+            conn.execute(
+                """
+                UPDATE mastery_learning_plans
+                SET brief_json = ?, brief_revision = brief_revision + 1, updated_at = ?
+                WHERE plan_id = ? AND owner_id = ?
+                """,
+                (json.dumps(brief, ensure_ascii=False), time.time(), plan_id, owner_id),
             )
         return self.get_learning_plan(plan_id, owner_id=owner_id) or {}
 

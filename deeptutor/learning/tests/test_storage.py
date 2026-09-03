@@ -42,6 +42,7 @@ class TestLearningPlans:
             owner_id="owner-a",
         )
         assert plan["state"] == "discussing"
+        assert plan["brief"] == plan["input"]
         assert store.get_learning_plan("plan-1", owner_id="owner-b") is None
 
         with pytest.raises(KeyError):
@@ -65,11 +66,16 @@ class TestLearningPlans:
 
     def test_brief_revision_and_reusable_planning_session(self, store):
         store.create_learning_plan("plan-1", {"name": "A"}, owner_id="owner-a")
+        revised = store.revise_learning_plan_brief(
+            "plan-1", {"name": "A", "goal": "Discussed goal"}, owner_id="owner-a"
+        )
+        assert revised["state"] == "discussing"
+        assert revised["brief"]["goal"] == "Discussed goal"
         updated = store.update_learning_plan_brief(
             "plan-1", {"name": "B", "goal": "Practice"}, owner_id="owner-a"
         )
         assert updated["brief"] == {"name": "B", "goal": "Practice"}
-        assert updated["brief_revision"] == 1
+        assert updated["brief_revision"] == 2
         session = store.create_planning_session("planning-1", owner_id="owner-a", plan_id="plan-1")
         assert session["planning_session_id"] == "planning-1"
         assert store.get_planning_session("planning-1", owner_id="owner-b") is None
