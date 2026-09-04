@@ -470,6 +470,38 @@ export interface GenerateTopicInput {
   must_cover?: string[];
 }
 
+export interface StructuredTopicDraftInput extends GenerateTopicInput {
+  topic: {
+    name: string;
+    purpose: string;
+    learning_purpose?: string | null;
+    custom_purpose?: string | null;
+  };
+  learner_context?: {
+    current_level?: string | null;
+    known_topics?: string[] | null;
+    skipped_topics?: string[] | null;
+  } | null;
+  scope?: { mode?: string | null; include?: string[]; exclude?: string[] } | null;
+  learning_preferences?: {
+    theory_practice?: string | null;
+    granularity?: string | null;
+    mathematical_rigor?: string | null;
+    activities?: string[] | null;
+  } | null;
+  time_constraints?: {
+    mode?: string | null;
+    weekly_hours?: number | null;
+    target_date?: string | null;
+    target_duration_weeks?: number | null;
+    session_duration_minutes?: number | null;
+  } | null;
+  milestones?: {
+    preference?: string | null;
+    items?: { name: string; description?: string | null; target_week?: number | null }[] | null;
+  } | null;
+}
+
 export interface CreateTopicInput extends GenerateTopicInput {
   description?: string;
   emoji?: string;
@@ -578,6 +610,20 @@ export function fetchMasteryTopic(
 
 export function generateMasteryTopicDraft(
   input: GenerateTopicInput,
+): Promise<TopicDraft> {
+  return masteryJson(
+    "/api/mastery-paths/topics/draft",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    },
+    "generate learning route",
+  );
+}
+
+export function generateMasteryTopicDraftCompatible(
+  input: StructuredTopicDraftInput,
 ): Promise<TopicDraft> {
   return masteryJson(
     "/api/mastery-paths/topics/draft",
