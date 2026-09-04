@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
@@ -19,6 +20,7 @@ from deeptutor.learning.models import (
 )
 from deeptutor.learning.storage import (
     LearningConflictError,
+    LearningPlanConflictError,
     LearningStore,
     LearningStoreError,
     PathLeaseConflictError,
@@ -79,6 +81,75 @@ class TestLearningPlans:
         session = store.create_planning_session("planning-1", owner_id="owner-a", plan_id="plan-1")
         assert session["planning_session_id"] == "planning-1"
         assert store.get_planning_session("planning-1", owner_id="owner-b") is None
+
+    @pytest.mark.parametrize(
+        ("method_name", "initial_state", "payload"),
+        [
+            ("settle_learning_plan", "discussing", {"name": "Settled"}),
+            ("update_learning_plan_brief", "discussing", {"name": "Updated"}),
+            ("update_learning_plan_route_draft", "draft_ready", {"modules": [{"name": "Edited"}]}),
+        ],
+    )
+    def test_mutations_reject_claim_that_arrives_between_guard_and_update(
+        self, store, monkeypatch, method_name, initial_state, payload
+    ):
+        """A conditional update must see an operation claim made after the guard read."""
+        plan_id = f"plan-{method_name}"
+        owner_id = "owner-a"
+        store.create_learning_plan(plan_id, {"name": "Original"}, owner_id=owner_id)
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE mastery_learning_plans SET state = ? WHERE plan_id = ? AND owner_id = ?",
+                (initial_state, plan_id, owner_id),
+            )
+
+        original_connect = store._connect
+        guard_read_seen = False
+
+        @contextmanager
+        def interleaving_connect(*args, **kwargs):
+            nonlocal guard_read_seen
+            with original_connect(*args, **kwargs) as conn:
+
+                class ConnectionProxy:
+                    def execute(self, sql, parameters=()):
+                        nonlocal guard_read_seen
+                        if (
+                            not guard_read_seen
+                            and "SELECT state" in sql
+                            and "operation_kind" in sql
+                            and "mastery_learning_plans" in sql
+                        ):
+                            result = conn.execute(sql, parameters)
+                            guard_read_seen = True
+                            with LearningStore(root=store._root)._connect() as competing:
+                                competing.execute(
+                                    """UPDATE mastery_learning_plans
+                                    SET operation_kind = 'generation', operation_token = 'rival'
+                                    WHERE plan_id = ? AND owner_id = ?""",
+                                    (plan_id, owner_id),
+                                )
+                            return result
+                        return conn.execute(sql, parameters)
+
+                    def __getattr__(self, name):
+                        return getattr(conn, name)
+
+                yield ConnectionProxy()
+
+        monkeypatch.setattr(store, "_connect", interleaving_connect)
+        with pytest.raises(LearningPlanConflictError, match="busy"):
+            getattr(store, method_name)(plan_id, payload, owner_id=owner_id)
+
+        plan = store.get_learning_plan(plan_id, owner_id=owner_id)
+        assert plan is not None
+        with LearningStore(root=store._root)._connect() as conn:
+            operation_kind = conn.execute(
+                "SELECT operation_kind FROM mastery_learning_plans WHERE plan_id = ? AND owner_id = ?",
+                (plan_id, owner_id),
+            ).fetchone()["operation_kind"]
+        assert operation_kind == "generation"
+        assert plan["brief"]["name"] == "Original"
 
 
 # ── save / load ──────────────────────────────────────────────────────────
