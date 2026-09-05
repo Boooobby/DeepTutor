@@ -4881,5 +4881,9 @@
   "Planning conflict": "Planning changed elsewhere. Please retry.",
   "Ready to generate": "Ready to generate",
   "Draft ready": "Draft ready",
-  "Revision {{n}} · {{status}}": "Revision {{n}} · {{status}}"
+  "Revision {{n}} · {{status}}": "Revision {{n}} · {{status}}",
+  "Experimental": "Experimental",
+  "Try opt-in features that are still being refined.": "Try opt-in features that are still being refined.",
+  "New mastery planning flow": "New mastery planning flow",
+  "Enable the new Planning Workspace and Route Draft creation flow.": "Enable the new Planning Workspace and Route Draft creation flow."
 }

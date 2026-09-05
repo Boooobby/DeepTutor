@@ -6,6 +6,7 @@ import {
   useEffect,
   useMemo,
   useState,
+  useRef,
 } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
@@ -16,6 +17,8 @@ import {
   useCourseScope,
 } from "@/components/courses/CourseScope";
 import { TopicAtlas } from "@/components/space/learning/TopicAtlas";
+import { CreateTopicWizard } from "@/components/space/learning/CreateTopicWizard";
+import { useAppShell } from "@/context/AppShellContext";
 import { fetchMasteryTopics, type MasteryTopic } from "@/lib/learning-api";
 
 function MasteryPathRoute() {
@@ -27,6 +30,9 @@ function MasteryPathRoute() {
   // Present when opened from a course page or a Course Study hand-off. It both
   // narrows the atlas to that course's paths and adopts whatever is built here.
   const scope = useCourseScope();
+  const { experimentalMasteryPlanning } = useAppShell();
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const returnFocus = useRef<HTMLButtonElement | null>(null);
 
   const loadTopics = useCallback(async () => {
     setError(null);
@@ -63,12 +69,22 @@ function MasteryPathRoute() {
         loading={loading}
         error={error}
         scopeChip={scope ? <CourseScopeChip scope={scope} /> : null}
-        onCreate={() => router.push("/mastery/new")}
+        onCreate={(trigger) => {
+          if (experimentalMasteryPlanning) router.push("/mastery/new");
+          else { returnFocus.current = trigger; setWizardOpen(true); }
+        }}
         onRetry={() => {
           setLoading(true);
           void loadTopics();
         }}
       />
+      {wizardOpen && !experimentalMasteryPlanning && (
+        <CreateTopicWizard
+          onClose={() => { setWizardOpen(false); returnFocus.current?.focus(); }}
+          onCreated={(topic) => { setWizardOpen(false); void loadTopics(); router.push(`/mastery/${encodeURIComponent(topic.path_id)}`); }}
+          returnFocusRef={returnFocus}
+        />
+      )}
     </>
   );
 }

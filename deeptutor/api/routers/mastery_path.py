@@ -29,7 +29,7 @@ from deeptutor.learning.models import (
 from deeptutor.learning.service import LearningService
 from deeptutor.learning.storage import LearningPlanConflictError, LearningStore
 from deeptutor.learning.topic_generation import MAX_MODULE_LIMIT
-from deeptutor.services.settings.interface_settings import get_response_language
+from deeptutor.services.settings.interface_settings import get_response_language, get_ui_settings
 from deeptutor.utils.json_parser import parse_json_response
 
 router = APIRouter()
@@ -524,6 +524,11 @@ def _learning_plan_owner_id() -> str:
     return get_current_user().id
 
 
+def _require_experimental_mastery_planning() -> None:
+    if not bool(get_ui_settings().get("experimental_mastery_planning", False)):
+        raise HTTPException(status_code=404, detail="Experimental mastery planning is disabled")
+
+
 def _merge_plan_brief(current: dict, revision: dict) -> dict:
     """Merge a planning-AI partial revision while retaining omitted choices."""
     merged = dict(current)
@@ -687,6 +692,7 @@ async def generate_topic_route(body: GenerateTopicDraftRequest):
 @router.post("/learning-plans")
 async def start_learning_plan(body: StartLearningPlanRequest):
     """Open a durable planning discussion without creating or changing a path."""
+    _require_experimental_mastery_planning()
     await _selected_mastery_context(body)  # Validate access now; do not retain session content.
     plan_id = f"learning_plan_{uuid.uuid4().hex}"
     store = LearningStore()
@@ -722,11 +728,13 @@ async def _get_learning_plan_or_404(plan_id: str) -> dict:
 
 @router.get("/learning-plans/{plan_id}")
 async def get_learning_plan(plan_id: str):
+    _require_experimental_mastery_planning()
     return await _get_learning_plan_or_404(plan_id)
 
 
 @router.post("/learning-plans/{plan_id}/planning-session/messages")
 async def discuss_learning_plan(plan_id: str, body: PlanningSessionMessageRequest):
+    _require_experimental_mastery_planning()
     store = LearningStore()
     owner_id = _learning_plan_owner_id()
     try:
@@ -793,6 +801,7 @@ async def discuss_learning_plan(plan_id: str, body: PlanningSessionMessageReques
 
 @router.post("/learning-plans/{plan_id}/settle")
 async def settle_learning_plan(plan_id: str, body: SettleLearningPlanRequest):
+    _require_experimental_mastery_planning()
     store = LearningStore()
     try:
         return await asyncio.to_thread(
@@ -809,6 +818,7 @@ async def settle_learning_plan(plan_id: str, body: SettleLearningPlanRequest):
 
 @router.post("/learning-plans/{plan_id}/route-draft")
 async def generate_learning_plan_route_draft(plan_id: str, force: bool = Query(default=False)):
+    _require_experimental_mastery_planning()
     store = LearningStore()
     owner_id = _learning_plan_owner_id()
     try:
@@ -853,6 +863,7 @@ async def generate_learning_plan_route_draft(plan_id: str, force: bool = Query(d
 
 @router.put("/learning-plans/{plan_id}/route-draft")
 async def save_learning_plan_route_draft(plan_id: str, body: SaveLearningPlanRouteDraftRequest):
+    _require_experimental_mastery_planning()
     try:
         return await asyncio.to_thread(
             LearningStore().update_learning_plan_route_draft,
@@ -869,6 +880,7 @@ async def save_learning_plan_route_draft(plan_id: str, body: SaveLearningPlanRou
 @router.post("/planning-sessions")
 async def create_reusable_planning_session(plan_id: str = ""):
     """Open an optional planning conversation, reusable for a plan revision."""
+    _require_experimental_mastery_planning()
     if plan_id:
         await _get_learning_plan_or_404(plan_id)
     session_id = f"planning_{uuid.uuid4().hex}"
@@ -882,6 +894,7 @@ async def create_reusable_planning_session(plan_id: str = ""):
 
 @router.get("/planning-sessions/{planning_session_id}")
 async def get_reusable_planning_session(planning_session_id: str):
+    _require_experimental_mastery_planning()
     session = await asyncio.to_thread(
         LearningStore().get_planning_session,
         planning_session_id,
@@ -894,6 +907,7 @@ async def get_reusable_planning_session(planning_session_id: str):
 
 @router.post("/learning-plans/{plan_id}/brief")
 async def update_learning_plan_brief(plan_id: str, body: SettleLearningPlanRequest):
+    _require_experimental_mastery_planning()
     try:
         return await asyncio.to_thread(
             LearningStore().update_learning_plan_brief,

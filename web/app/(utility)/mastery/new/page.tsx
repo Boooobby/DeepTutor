@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { ArrowLeft, ArrowRight, Check, Loader2, Sparkles } from "lucide-react";
@@ -14,6 +14,7 @@ import { createLearningPlan, createMasteryTopic, generateMasteryTopicDraftCompat
 import { isRouteDraftValid } from "@/components/space/learning/route-draft";
 import { buildStructuredTopicDraftInput, structuredPlanIssues, type MasteryPathFormValues } from "@/lib/mastery-path-form";
 import { learningPlanRoute } from "@/lib/mastery-planning-route";
+import { useAppShell } from "@/context/AppShellContext";
 
 const ACTIVITY_LABELS = {
   reading: "Reading",
@@ -27,6 +28,7 @@ export default function NewMasteryPathPage() {
   const { t } = useTranslation();
   const router = useRouter();
   const scope = useCourseScope();
+  const { experimentalMasteryPlanning, experimentalMasteryPlanningReady } = useAppShell();
   const [step, setStep] = useState(1);
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
@@ -56,6 +58,13 @@ export default function NewMasteryPathPage() {
   const [sources, setSources] = useState<TopicSourceInput[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (experimentalMasteryPlanningReady && !experimentalMasteryPlanning) {
+      router.replace("/mastery");
+    }
+  }, [experimentalMasteryPlanning, experimentalMasteryPlanningReady, router]);
+  if (experimentalMasteryPlanningReady && !experimentalMasteryPlanning) return null;
 
   const toggle = (key: string) => setSelected((s) => toggleSourceSelection(s, key, candidates));
   const formValues = (): MasteryPathFormValues => ({ name, goal, learningPurpose, customPurpose, level, knownTopics, skippedTopics, scopeMode, scopeInclude, scopeExclude, approach, granularity, rigor, activities, timeMode, weeklyHours, durationWeeks, deadline, sessionMinutes, milestonePreference, milestones });

@@ -4881,5 +4881,9 @@
   "Planning conflict": "规划已在其他位置更改，请重试。",
   "Ready to generate": "可生成路线",
   "Draft ready": "草稿已就绪",
-  "Revision {{n}} · {{status}}": "第 {{n}} 版 · {{status}}"
+  "Revision {{n}} · {{status}}": "第 {{n}} 版 · {{status}}",
+  "Experimental": "测试",
+  "Try opt-in features that are still being refined.": "试用仍在完善中的可选功能。",
+  "New mastery planning flow": "新版精通之路创建流程",
+  "Enable the new Planning Workspace and Route Draft creation flow.": "启用新版 Planning Workspace 和 Route Draft 创建流程。"
 }

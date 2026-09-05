@@ -37,6 +37,15 @@ def client(app):
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def enable_experimental_mastery_planning(monkeypatch):
+    """Keep new planning API tests independent of a developer's runtime data."""
+    monkeypatch.setattr(
+        "deeptutor.api.routers.mastery_path.get_ui_settings",
+        lambda: {"experimental_mastery_planning": True},
+    )
+
+
 def _module_payload(module_id: str = "m1", kp_id: str = "kp1") -> dict:
     return {
         "id": module_id,
@@ -2043,3 +2052,79 @@ class TestBookIdValidation:
         elif method == "DELETE":
             resp = client.delete(path, **kwargs)
         assert resp.status_code == 400, f"{method} {path} should return 400, got {resp.status_code}"
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("POST", "/api/mastery-paths/learning-plans", {"name": "Algebra", "goal": "Learn algebra"}),
+        ("GET", "/api/mastery-paths/learning-plans/plan-1", None),
+        (
+            "POST",
+            "/api/mastery-paths/learning-plans/plan-1/planning-session/messages",
+            {"content": "Help me plan."},
+        ),
+        (
+            "POST",
+            "/api/mastery-paths/learning-plans/plan-1/settle",
+            {"name": "Algebra", "goal": "Learn algebra"},
+        ),
+        ("POST", "/api/mastery-paths/learning-plans/plan-1/route-draft", None),
+        (
+            "PUT",
+            "/api/mastery-paths/learning-plans/plan-1/route-draft",
+            {"description": "Draft", "modules": []},
+        ),
+        ("POST", "/api/mastery-paths/planning-sessions", None),
+        ("GET", "/api/mastery-paths/planning-sessions/session-1", None),
+        (
+            "POST",
+            "/api/mastery-paths/learning-plans/plan-1/brief",
+            {"name": "Algebra", "goal": "Learn algebra"},
+        ),
+    ],
+)
+def test_new_planning_api_is_hidden_when_experimental_gate_is_off(
+    client, monkeypatch, method, path, body
+):
+    monkeypatch.setattr(
+        "deeptutor.api.routers.mastery_path.get_ui_settings",
+        lambda: {"experimental_mastery_planning": False},
+    )
+    response = getattr(client, method.lower())(path, **({"json": body} if body else {}))
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Experimental mastery planning is disabled"
+
+
+def test_legacy_topic_draft_and_materialization_remain_available_when_gate_is_off(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        "deeptutor.api.routers.mastery_path.get_ui_settings",
+        lambda: {"experimental_mastery_planning": False},
+    )
+    response_json = json.dumps(
+        {
+            "description": "A compact route.",
+            "modules": [
+                {
+                    "name": "Foundations",
+                    "knowledge_points": [{"name": "Vectors", "type": "concept"}],
+                }
+            ],
+        }
+    )
+    with patch(
+        "deeptutor.learning.topic_generation.complete",
+        new=AsyncMock(return_value=response_json),
+    ):
+        drafted = client.post(
+            "/api/mastery-paths/topics/draft",
+            json={"name": "Algebra", "goal": "Learn algebra", "sources": []},
+        )
+    assert drafted.status_code == 200
+    materialized = client.post(
+        "/api/mastery-paths/topics",
+        json={"name": "Algebra", "goal": "Learn algebra", "sources": [], **drafted.json()},
+    )
+    assert materialized.status_code == 200
